@@ -1,81 +1,104 @@
-resource "aws_iam_role" "cluster" {
-  name = "${var.cluster_name}-cluster-role"
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_hostnames = true
+  enable_dns_support   = true
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "eks.amazonaws.com"
-      }
-    }]
-  })
+  tags = {
+    Name                                           = "${var.cluster_name}-vpc"
+    "kubernetes.io/cluster/${var.cluster_name}"    = "shared"
+  }
 }
 
-resource "aws_iam_role_policy_attachment" "cluster_policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
-  role       = aws_iam_role.cluster.name
+resource "aws_subnet" "private" {
+  count             = length(var.private_subnet_cidrs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_subnet_cidrs[count.index]
+  availability_zone = var.availability_zones[count.index]
+
+  tags = {
+    Name                                           = "${var.cluster_name}-private-${count.index + 1}"
+    "kubernetes.io/cluster/${var.cluster_name}"    = "shared"
+    "kubernetes.io/role/internal-elb"              = "1"
+  }
 }
 
-resource "aws_eks_cluster" "main" {
-  name     = var.cluster_name
-  version  = var.cluster_version
-  role_arn = aws_iam_role.cluster.arn
+resource "aws_subnet" "public" {
+  count             = length(var.public_subnet_cidrs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.public_subnet_cidrs[count.index]
+  availability_zone = var.availability_zones[count.index]
 
-  vpc_config {
-    subnet_ids = var.subnet_ids
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name                                           = "${var.cluster_name}-public-${count.index + 1}"
+    "kubernetes.io/cluster/${var.cluster_name}"    = "shared"
+    "kubernetes.io/role/elb"                       = "1"
+  }
+}
+
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "${var.cluster_name}-igw"
+  }
+}
+
+resource "aws_eip" "nat" {
+  count = length(var.public_subnet_cidrs)
+  domain = "vpc"
+
+  tags = {
+    Name = "${var.cluster_name}-nat-${count.index + 1}"
+  }
+}
+
+resource "aws_nat_gateway" "main" {
+  count         = length(var.public_subnet_cidrs)
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
+
+  tags = {
+    Name = "${var.cluster_name}-nat-${count.index + 1}"
+  }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
   }
 
-  depends_on = [
-    aws_iam_role_policy_attachment.cluster_policy
-  ]
+  tags = {
+    Name = "${var.cluster_name}-public"
+  }
 }
 
-resource "aws_iam_role" "node" {
-  name = "${var.cluster_name}-node-role"
+resource "aws_route_table" "private" {
+  count  = length(var.private_subnet_cidrs)
+  vpc_id = aws_vpc.main.id
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "ec2.amazonaws.com"
-      }
-    }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "node_policy" {
-  for_each = toset([
-    "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
-    "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
-    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-  ])
-
-  policy_arn = each.value
-  role       = aws_iam_role.node.name
-}
-
-resource "aws_eks_node_group" "main" {
-  for_each = var.node_groups
-
-  cluster_name    = aws_eks_cluster.main.name
-  node_group_name = each.key
-  node_role_arn   = aws_iam_role.node.arn
-  subnet_ids      = var.subnet_ids
-
-  instance_types = each.value.instance_types
-  capacity_type  = each.value.capacity_type
-
-  scaling_config {
-    desired_size = each.value.scaling_config.desired_size
-    max_size     = each.value.scaling_config.max_size
-    min_size     = each.value.scaling_config.min_size
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
   }
 
-  depends_on = [
-    aws_iam_role_policy_attachment.node_policy
-  ]
+  tags = {
+    Name = "${var.cluster_name}-private-${count.index + 1}"
+  }
+}
+
+resource "aws_route_table_association" "private" {
+  count          = length(var.private_subnet_cidrs)
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private[count.index].id
+}
+
+resource "aws_route_table_association" "public" {
+  count          = length(var.public_subnet_cidrs)
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
 }
